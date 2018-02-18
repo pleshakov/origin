@@ -3,7 +3,8 @@
 set -o nounset
 
 config_file=/var/lib/nginx/conf/nginx.config
-if [ -f /var/lib/nginx/logs/nginx.pid ]; then
+
+if [ -f /var/lib/nginx/run/nginx.pid ]; then
   /usr/sbin/nginx -c ${config_file} -s reload
   reload_status=$?
 else

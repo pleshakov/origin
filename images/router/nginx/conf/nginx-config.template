@@ -5,92 +5,170 @@
 */}}
 {{- define "/var/lib/nginx/conf/nginx.config" -}}
 {{- $workingDir := .WorkingDir }}
-#user       www www;  ## Default: nobody
-worker_processes  5;  ## Default: 1
+{{- $defaultDestinationCA := .DefaultDestinationCA }}
+worker_processes  auto;
 error_log  /var/lib/nginx/logs/error.log;
-pid        /var/lib/nginx/logs/nginx.pid;
+pid        /var/lib/nginx/run/nginx.pid;
 worker_rlimit_nofile 8192;
 
 events {
-  worker_connections  4096;  ## Default: 1024
+  worker_connections  4096;
 }
 
 http {
-  #include    conf/mime.types;
-  #include    /etc/nginx/proxy.conf;
-  #include    /etc/nginx/fastcgi.conf;
-  index    index.html index.htm index.php;
-
-  ssl_certificate     {{$workingDir}}/certs/default.pem;
-  ssl_certificate_key {{$workingDir}}/certs/default.pem;
-
   default_type application/octet-stream;
+
   log_format   main '$remote_addr - $remote_user [$time_local]  $status '
     '"$request" $body_bytes_sent "$http_referer" '
     '"$http_user_agent" "$http_x_forwarded_for"';
   access_log   /var/lib/nginx/logs/access.log  main;
   sendfile     on;
   tcp_nopush   on;
-  server_names_hash_bucket_size 128; # this seems to be required for some vhosts
+  server_names_hash_bucket_size 128;
 
+  proxy_temp_path /var/lib/nginx/cache/proxy_temp;
+  client_body_temp_path /var/lib/nginx/cache/client_temp;
+  fastcgi_temp_path /var/lib/nginx/cache/fastcgi_temp;
+  uwsgi_temp_path /var/lib/nginx/cache/uwsgi_temp;
+  scgi_temp_path /var/lib/nginx/cache/scgi_temp;
 
+  server {
+    listen 1936;
 
-{{- range $cfgIdx, $cfg := .State }}
-
-  upstream be_{{$cfg.Namespace}}_{{$cfg.Name}} {
-    {{- range $serviceUnitName, $weight := $cfg.ServiceUnitNames }}
-      {{- with $serviceUnit := index $.ServiceUnits $serviceUnitName }}
-        {{- range $idx, $endpoint := endpointsForAlias $cfg $serviceUnit }}
-    server {{$endpoint.IP}}:{{$endpoint.Port}};
-        {{ end -}}
-      {{ end -}}
-    {{ end -}}
+    location /healthz {
+      return 200 "healthy\n";
+    }
   }
 
-  server { # simple load balancing
- {{- if (eq $cfg.TLSTermination "") }}
-    listen          80;
- {{- else }}
-    listen          80 ssl;
-    listen          443 ssl;
- {{ end -}}
- 
-server_name     {{$cfg.Host}};
- {{- if and (ne $cfg.Host "") (or (eq $cfg.TLSTermination "edge") (eq $cfg.TLSTermination "reencrypt")) (eq $cfg.InsecureEdgeTerminationPolicy "Allow") }}
-  {{ $cert := index $cfg.Certificates $cfg.Host -}}
-  {{ if ne $cert.Contents "" }}
-    ssl on;
-    ssl_certificate     {{$workingDir}}/certs/{{$cfgIdx}}.pem;
-    ssl_certificate_key {{$workingDir}}/certs/{{$cfgIdx}}.pem;
-    ssl_session_timeout  5m;
-    ssl_protocols  TLSv1 TLSv1.1 TLSv1.2;
-    ssl_ciphers AES128-GCM-SHA256:ECDHE-RSA-AES128-SHA256:RC4:HIGH:!MD5:!aNULL:!eNULL:!NULL:!DH:!EDH:!AESGCM:!LOW:!EXP;
-    ssl_prefer_server_ciphers   on;
-  {{ end -}}
+  # default server
+  server {
+    listen 80 default_server;
+    listen 127.0.0.1:10443 default_server;
 
- {{- else if and (ne $cfg.Host "") (or (eq $cfg.TLSTermination "edge") (eq $cfg.TLSTermination "reencrypt")) (eq $cfg.InsecureEdgeTerminationPolicy "Redirect") }}
- {{/*- else if (eq $cfg.InsecureEdgeTerminationPolicy "Redirect") */}}
-  {{ $cert := index $cfg.Certificates $cfg.Host -}}
-  {{ if ne $cert.Contents "" }}
-    ssl on;
-    ssl_certificate     {{$workingDir}}/certs/{{$cfgIdx}}.pem;
-    ssl_certificate_key {{$workingDir}}/certs/{{$cfgIdx}}.pem;
-    ssl_session_timeout  5m;
-    ssl_protocols  TLSv1 TLSv1.1 TLSv1.2;
-    ssl_ciphers AES128-GCM-SHA256:ECDHE-RSA-AES128-SHA256:RC4:HIGH:!MD5:!aNULL:!eNULL:!NULL:!DH:!EDH:!AESGCM:!LOW:!EXP;
-    ssl_prefer_server_ciphers   on;
-    if ($scheme = http) {
-        return   301 https://$host$request_uri;
-    }
-  {{ end -}}
- {{ end -}}
- 
-    access_log      /var/lib/nginx/logs/be_{{$cfgIdx}}.log main;
+    server_name _;
+
+    ssl_certificate /etc/pki/tls/private/tls.crt;
+    ssl_certificate_key /etc/pki/tls/private/tls.key; 
+
+    error_page 503 /error-page-503.html; 
 
     location / {
-      proxy_pass      http://be_{{$cfg.Namespace}}_{{$cfg.Name}};
+      return 503;
+    }
+    
+    location = /error-page-503.html {
+      root /var/lib/nginx/conf;
     }
   }
+
+{{- range $cfgIdx, $cfg := .State }}
+  {{ if and (ne $cfg.Host "") (ne $cfg.TLSTermination "passthrough") }}
+  upstream be_{{$cfg.Namespace}}_{{$cfg.Name}} {
+    {{ if ne $cfg.ActiveEndpoints 0 }}
+      {{- range $serviceUnitName, $weight := $cfg.ServiceUnitNames }}
+        # endpoints of {{$serviceUnitName}} 
+        {{- with $serviceUnit := index $.ServiceUnits $serviceUnitName }}
+          {{- range $idx, $endpoint := endpointsForAlias $cfg $serviceUnit }}
+    server {{$endpoint.IP}}:{{$endpoint.Port}} weight={{$weight}};
+          {{ end -}}
+        {{ end -}}
+      {{ end -}}
+    {{ else }}
+    server 127.0.0.1:10444;
+    {{ end }}
+  }
+
+  server {
+  {{ if or (eq $cfg.TLSTermination "") (or (eq $cfg.InsecureEdgeTerminationPolicy "Allow") (eq $cfg.InsecureEdgeTerminationPolicy "Redirect")) }}
+    listen 80;
+  {{ end }}
+  
+    server_name {{genCertificateHostName $cfg.Host $cfg.IsWildcard}};
+
+  {{ if eq $cfg.InsecureEdgeTerminationPolicy "Redirect" }}
+    if ($scheme = http) {
+      return 301 https://$host$request_uri;
+    }
+  {{ end }}
+
+  {{- if (or (eq $cfg.TLSTermination "edge") (eq $cfg.TLSTermination "reencrypt")) -}}
+    {{ $cert := index $cfg.Certificates $cfg.Host -}}
+    {{ if ne $cert.Contents "" }}
+    listen 127.0.0.1:10443 ssl;
+    ssl_certificate     {{$workingDir}}/certs/{{$cfgIdx}}.pem;
+    ssl_certificate_key {{$workingDir}}/certs/{{$cfgIdx}}.pem;
+    {{ end }}
+  {{ end }}
+
+    access_log      /var/lib/nginx/logs/route_{{$cfgIdx}}.log main;
+
+    # for now it is not possible to support path-based routing
+
+    location / {
+  {{ if eq $cfg.TLSTermination "reencrypt" }}
+      proxy_ssl_name {{ $cfg.Host }};
+      {{- if gt (len (index $cfg.Certificates (printf "%s_pod" $cfg.Host)).Contents) 0 }}
+      proxy_ssl_trusted_certificate {{ $workingDir }}/cacerts/{{$cfgIdx}}.pem;
+      proxy_ssl_verify on;
+      {{ else }}
+        {{ if gt (len $defaultDestinationCA) 0 }}
+      proxy_ssl_trusted_certificate {{ $defaultDestinationCA }};
+      proxy_ssl_verify on;
+        {{ else }}
+      proxy_ssl_verify off;
+        {{ end }}
+      {{ end }}
+      proxy_pass      https://be_{{$cfg.Namespace}}_{{$cfg.Name}};
+  {{ else }}
+      proxy_pass      http://be_{{$cfg.Namespace}}_{{$cfg.Name}};
+  {{ end }}
+    }
+  }
+  {{ end }}
 {{ end -}}{{/* end all routes */}}
+}
+
+stream {
+  log_format basic '$remote_addr [$time_local] '
+                     '$protocol $status $bytes_sent $bytes_received '
+                     '$session_time "$ssl_preread_server_name" $dest';
+  
+  upstream https-route {
+    server 127.0.0.1:10443;
+  }
+
+  {{- range $cfgIdx, $cfg := .State }}
+  {{ if and (eq $cfg.Path "") (eq $cfg.TLSTermination "passthrough") -}}
+  upstream be_passthrough_{{$cfg.Namespace}}_{{$cfg.Name}} {
+    {{ if ne $cfg.ActiveEndpoints 0 }}
+      {{- range $serviceUnitName, $weight := $cfg.ServiceUnitNames }}
+        {{- with $serviceUnit := index $.ServiceUnits $serviceUnitName }}
+          {{- range $idx, $endpoint := endpointsForAlias $cfg $serviceUnit }}
+    server {{$endpoint.IP}}:{{$endpoint.Port}};
+          {{ end -}}
+        {{ end -}}
+      {{ end -}}
+    {{ else }}
+    server 127.0.0.1:10444;
+    {{ end }}
+  }
+  {{ end }}
+  {{ end }}
+
+  map $ssl_preread_server_name $dest {
+    {{- range $cfgIdx, $cfg := .State }}
+      {{ if and (ne $cfg.Host "") (and (eq $cfg.Path "") (eq $cfg.TLSTermination "passthrough")) -}}
+    {{ $cfg.Host }} be_passthrough_{{$cfg.Namespace}}_{{$cfg.Name}}; 
+      {{ end }}
+    {{ end }}
+    default https-route;
+  }
+
+  server {
+    listen 443;
+    access_log /var/lib/nginx/logs/stream_tls_server.log basic;
+    proxy_pass $dest;
+    ssl_preread on;
+  }
 }
 {{ end -}}{{/* end config file */}}
